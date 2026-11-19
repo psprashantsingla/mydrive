@@ -61,55 +61,93 @@ sysctl -q -w vm.swappiness=10 >/dev/null || true
 echo 'vm.swappiness=10' > /etc/sysctl.d/90-mydrive.conf
 
 # ------------------------------------------------------------------ block volume
-step "Setting up the storage volume at $DATA_DIR"
+# Never touch system folders: the data folder must be a dedicated directory.
+safe_data_dir() {
+  case "${1%/}" in
+    ""|/|/bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/home|/lib|/lib/*|/lib32|/lib64|/libx32|/media|/mnt|/opt|/proc|/proc/*|/root|/root/*|/run|/run/*|/sbin|/sbin/*|/snap|/snap/*|/srv|/sys|/sys/*|/tmp|/tmp/*|/usr|/usr/*|/var|/var/lib|/var/log|/var/log/*|/var/cache|/var/cache/*|/opt/mydrive|/opt/mydrive/*) return 1 ;;
+    /*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+safe_data_dir "$DATA_DIR" || die "Refusing to use '$DATA_DIR' as the data folder (system path). Use something like /data."
+
+# Prints candidate data disks (>= 50 GB, nothing on them mounted / used as swap / LVM / RAID).
+# The boot disk always has mounted partitions, so it can never be a candidate.
+find_free_disks() {
+  local line NAME TYPE SIZE FSTYPE MOUNTPOINT PKNAME d
+  local -A parent=() kind=() bytes=() used=()
+  local -a order=()
+  while IFS= read -r line; do
+    NAME="" TYPE="" SIZE="" FSTYPE="" MOUNTPOINT="" PKNAME=""
+    eval "$line"
+    order+=("$NAME"); parent[$NAME]="$PKNAME"; kind[$NAME]="$TYPE"; bytes[$NAME]="${SIZE:-0}"
+    if [[ -n "$MOUNTPOINT" || "$FSTYPE" =~ ^(swap|LVM2_member|linux_raid_member|crypto_LUKS|zfs_member)$ ]]; then
+      used[$NAME]=1
+    fi
+  done < <(lsblk -Pbpo NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,PKNAME)
+  # propagate "in use" from children up to their disk
+  for d in "${order[@]}"; do
+    if [[ -n "${used[$d]:-}" ]]; then
+      local p="${parent[$d]:-}" guard=0
+      while [[ -n "$p" && $guard -lt 10 ]]; do used[$p]=1; p="${parent[$p]:-}"; guard=$((guard+1)); done
+    fi
+  done
+  for d in "${order[@]}"; do
+    [[ "${kind[$d]}" == disk && -z "${used[$d]:-}" && "${bytes[$d]}" -ge $((50*1024*1024*1024)) ]] && echo "$d"
+  done | sort -u
+}
+
+step "Setting up the storage folder $DATA_DIR"
 if mountpoint -q "$DATA_DIR"; then
   info "$DATA_DIR is already mounted ($(df -h --output=size "$DATA_DIR" | tail -1 | tr -d ' '))"
+elif [[ -f "$DATA_DIR/mydrive.db" ]]; then
+  info "using the existing MyDrive data in $DATA_DIR"
 else
-  ROOT_SRC="$(findmnt -no SOURCE /)"
-  ROOT_DISK="$(lsblk -snpo NAME,TYPE "$ROOT_SRC" 2>/dev/null | awk '$2=="disk"{print $1}' | tail -1)"
-  mapfile -t CANDS < <(lsblk -dbnpo NAME,SIZE,TYPE | awk -v r="$ROOT_DISK" '$3=="disk" && $1!=r && $2>=50*1024*1024*1024 {print $1}')
+  mapfile -t CANDS < <(find_free_disks)
   if [[ ${#CANDS[@]} -eq 0 ]]; then
     echo
-    lsblk -o NAME,SIZE,TYPE,MOUNTPOINT
-    die "No extra disk of 50 GB+ found. In the Oracle console open the instance → Attached block volumes.
-       If the attachment type is iSCSI, click ⋮ → 'iSCSI commands & information', run the ATTACH commands
-       shown there on this VM, then run this installer again. (Paravirtualized attachments need nothing extra.)"
-  fi
-  if [[ ${#CANDS[@]} -gt 1 ]]; then
     lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
-    DISK="$(ask "Several disks found. Which one is the 150 GB volume? (e.g. /dev/sdb):")"
+    ROOT_FREE=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+    echo
+    info "No separate, unused disk of 50 GB+ was found (the list above shows your disks)."
+    info "If you created a separate 150 GB block volume with iSCSI attachment, answer 'n', then in the"
+    info "Oracle console: instance → Attached block volumes → ⋮ → 'iSCSI commands & information',"
+    info "run the ATTACH commands on this VM and run the installer again."
+    info "If you instead made the BOOT volume 150 GB, answer 'y' to keep files in $DATA_DIR on it."
+    [[ $ROOT_FREE -ge $((10*1024*1024*1024)) ]] || die "The boot disk has less than 10 GB free."
+    [[ "$(ask "Store files in $DATA_DIR on the boot disk ($(numfmt --to=iec "$ROOT_FREE") free)? [y/N]:")" =~ ^[Yy] ]] \
+      || die "Cancelled — nothing was changed."
+    mkdir -p "$DATA_DIR"
   else
-    DISK="${CANDS[0]}"
-  fi
-  [[ -b "$DISK" ]] || die "$DISK is not a block device"
-
-  # If the disk was partitioned before, use its first partition that has a filesystem.
-  DEV="$DISK"
-  PART="$(lsblk -lnpo NAME,TYPE,FSTYPE "$DISK" | awk '$2=="part" && $3!="" {print $1; exit}')"
-  [[ -n "$PART" ]] && DEV="$PART"
-  CUR_MNT="$(lsblk -no MOUNTPOINT "$DEV" | head -1)"
-  if [[ -n "$CUR_MNT" ]]; then
-    warn "$DEV is already mounted at $CUR_MNT — using that as the data folder."
-    DATA_DIR="$CUR_MNT"
-  else
+    if [[ ${#CANDS[@]} -gt 1 ]]; then
+      lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+      DISK="$(ask "Several unused disks found (${CANDS[*]}). Which one is the 150 GB volume?:")"
+      printf '%s\n' "${CANDS[@]}" | grep -qxF -- "$DISK" || die "'$DISK' is not one of: ${CANDS[*]}"
+    else
+      DISK="${CANDS[0]}"
+    fi
+    # If the disk was partitioned before, use its first partition that has a filesystem.
+    DEV="$DISK"
+    PART="$(lsblk -lnpo NAME,TYPE,FSTYPE "$DISK" | awk '$2=="part" && $3!="" {print $1; exit}')"
+    [[ -n "$PART" ]] && DEV="$PART"
     FSTYPE="$(blkid -o value -s TYPE "$DEV" 2>/dev/null || true)"
     SIZE="$(lsblk -dno SIZE "$DISK" | tr -d ' ')"
+    echo
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$DISK"
     if [[ -n "$FSTYPE" ]]; then
-      info "$DEV ($SIZE) already has a $FSTYPE filesystem — it will be mounted as-is (no formatting)."
+      info "$DEV ($SIZE) already has a $FSTYPE filesystem — it will be mounted at $DATA_DIR as-is (no formatting)."
+      [[ "$(ask "Continue? [y/N]:")" =~ ^[Yy] ]] || die "Cancelled — nothing was changed."
     else
-      echo
-      lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$DISK"
-      warn "$DISK ($SIZE) is empty and will be FORMATTED as ext4. Anything on it is lost."
+      warn "$DISK ($SIZE) is empty and will be FORMATTED as ext4 and mounted at $DATA_DIR."
       [[ "$(ask "Type 'yes' to format $DISK:")" == "yes" ]] || die "Cancelled — nothing was changed."
       mkfs.ext4 -q -L mydrive -m 1 "$DEV"
       FSTYPE=ext4
       info "formatted $DEV"
     fi
     UUID="$(blkid -o value -s UUID "$DEV")"
+    [[ -n "$UUID" ]] || die "Could not read the UUID of $DEV"
     mkdir -p "$DATA_DIR"
-    if ! grep -q "UUID=$UUID" /etc/fstab; then
-      echo "UUID=$UUID $DATA_DIR $FSTYPE defaults,noatime,_netdev,nofail 0 2" >> /etc/fstab
-    fi
+    grep -q "UUID=$UUID" /etc/fstab || echo "UUID=$UUID $DATA_DIR $FSTYPE defaults,noatime,_netdev,nofail 0 2" >> /etc/fstab
     systemctl daemon-reload
     mount "$DATA_DIR"
     info "mounted $DEV at $DATA_DIR ($(df -h --output=size "$DATA_DIR" | tail -1 | tr -d ' ')) and added it to /etc/fstab"
@@ -140,8 +178,13 @@ fi
 "$UV" pip install -q --python "$APP_DIR/venv/bin/python" -r "$APP_DIR/requirements.txt"
 rm -rf "$APP_DIR/.uv-cache"
 chown -R root:root "$APP_DIR"
-find "$DATA_DIR" ! -user mydrive -exec chown mydrive:mydrive {} + 2>/dev/null || true
+safe_data_dir "$DATA_DIR" || die "Refusing to change ownership of '$DATA_DIR'"
+chown mydrive:mydrive "$DATA_DIR"
 chmod 750 "$DATA_DIR"
+# Only MyDrive's own sub-folders are ever chown'ed, never the data folder's other contents.
+for sub in files trash backups mydrive.db mydrive.db-wal mydrive.db-shm; do
+  if [[ -e "$DATA_DIR/$sub" ]]; then chown -R mydrive:mydrive "$DATA_DIR/$sub"; fi
+done
 info "done"
 
 # ------------------------------------------------------------------ config
