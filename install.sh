@@ -277,7 +277,10 @@ fi
 info "$(/usr/local/bin/caddy version | cut -d' ' -f1)"
 id caddy >/dev/null 2>&1 || useradd --system --home-dir /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy
 mkdir -p /etc/caddy
+CADDY_GLOBAL=""
+[[ -n "${EMAIL:-}" ]] && CADDY_GLOBAL=$'{\n\temail '"$EMAIL"$'\n}\n'
 cat > /etc/caddy/Caddyfile <<EOF
+$CADDY_GLOBAL
 $DOMAIN {
 	@text path / /static/* /api/files* /api/search* /api/trash* /api/shares* /api/keys* /api/admin/* /s/*
 	encode @text gzip
@@ -334,6 +337,20 @@ for _ in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/api/health" >/dev/null
 curl -fs "http://127.0.0.1:$PORT/api/health" >/dev/null || { journalctl -u mydrive -n 30 --no-pager; die "MyDrive did not start"; }
 systemctl restart caddy
 info "MyDrive and Caddy are running"
+
+step "Getting the HTTPS certificate for $DOMAIN (up to 90 seconds)"
+CERT_OK=0
+for _ in $(seq 1 30); do
+  if curl -fsS -m 5 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/api/health" >/dev/null 2>&1; then CERT_OK=1; break; fi
+  sleep 3
+done
+if [[ $CERT_OK == 1 ]]; then
+  info "certificate OK"
+else
+  warn "No certificate yet. Last Caddy messages:"
+  journalctl -u caddy --no-pager -n 200 | grep -iE "error|rate|too many|challenge|unauthorized|timeout" | tail -n 6 | sed 's/^/      /'
+  warn "If it mentions a rate limit / 'too many certificates', use a free DuckDNS name instead (see README)."
+fi
 
 # ------------------------------------------------------------------ first admin
 if [[ -z "$(sudo -u mydrive sqlite3 "$DATA_DIR/mydrive.db" 'SELECT 1 FROM users WHERE is_admin=1 LIMIT 1' 2>/dev/null)" ]]; then

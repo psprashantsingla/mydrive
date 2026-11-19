@@ -59,7 +59,17 @@ The installer:
 > *Attached block volumes* → ⋮ → *iSCSI commands & information*, run the **attach** commands on the VM,
 > then run the install command again.
 
-### c) Open it
+### c) If HTTPS fails: use a free DuckDNS name
+`sslip.io` names share one Let's Encrypt quota with everyone else, so the certificate is sometimes refused
+(rate limit). DuckDNS names count separately and are reliable:
+1. Go to https://www.duckdns.org, sign in, create a subdomain (e.g. `prashant-drive`) and set its IP to your VM's public IP.
+2. Re-run the installer with that name (your data is kept):
+```bash
+curl -fsSL https://raw.githubusercontent.com/psprashantsingla/mydrive/main/get.sh | sudo DOMAIN=prashant-drive.duckdns.org bash
+```
+Optionally add `EMAIL=you@example.com` (before `bash`) so the certificate authority can send expiry notices.
+
+### d) Open it
 **https://152-70-71-35.sslip.io**. `sslip.io` is a free DNS service that maps that name to your IP,
 which lets the server get a real HTTPS certificate without you buying a domain.
 
