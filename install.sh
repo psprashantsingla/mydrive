@@ -20,7 +20,28 @@ step() { echo; echo "${c_bold}==> $*${c_off}"; }
 info() { echo "    $*"; }
 warn() { echo "${c_yel}    ! $*${c_off}"; }
 die()  { echo "${c_red}ERROR: $*${c_off}" >&2; exit 1; }
-ask()  { local a; read -r -p "    $1 " a </dev/tty; echo "$a"; }
+GET_CMD="curl -fsSL https://raw.githubusercontent.com/psprashantsingla/mydrive/main/get.sh -o get.sh && sudo bash get.sh"
+# ask PROMPT  -> answer in $ANSWER (reads the keyboard even when the script itself is piped from curl)
+ask() {
+  ANSWER=""
+  if ! read -r -p "    ${c_bold}$1${c_off} " ANSWER </dev/tty; then
+    echo
+    die "Could not read your answer from the keyboard. Run the installer this way instead:
+       $GET_CMD"
+  fi
+  ANSWER="${ANSWER#"${ANSWER%%[![:space:]]*}"}"; ANSWER="${ANSWER%"${ANSWER##*[![:space:]]}"}"
+}
+# confirm PROMPT -> returns 0 for y/yes, 1 for n/no; keeps asking otherwise
+confirm() {
+  while true; do
+    ask "$1 Type y or n:"
+    case "${ANSWER,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) echo "    Please type y (yes) or n (no) and press Enter." ;;
+    esac
+  done
+}
 
 [[ $EUID -eq 0 ]] || die "Run with sudo:  sudo ./install.sh"
 [[ -f "$SRC_DIR/app/main.py" ]] || die "Run this from the extracted mydrive folder"
@@ -115,13 +136,14 @@ else
     info "run the ATTACH commands on this VM and run the installer again."
     info "If you instead made the BOOT volume 150 GB, answer 'y' to keep files in $DATA_DIR on it."
     [[ $ROOT_FREE -ge $((10*1024*1024*1024)) ]] || die "The boot disk has less than 10 GB free."
-    [[ "$(ask "Store files in $DATA_DIR on the boot disk ($(numfmt --to=iec "$ROOT_FREE") free)? [y/N]:")" =~ ^[Yy] ]] \
+    confirm "Store files in $DATA_DIR on the boot disk ($(numfmt --to=iec "$ROOT_FREE") free)?" \
       || die "Cancelled — nothing was changed."
     mkdir -p "$DATA_DIR"
   else
     if [[ ${#CANDS[@]} -gt 1 ]]; then
       lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
-      DISK="$(ask "Several unused disks found (${CANDS[*]}). Which one is the 150 GB volume?:")"
+      ask "Several unused disks found (${CANDS[*]}). Which one is the 150 GB volume?"
+      DISK="$ANSWER"
       printf '%s\n' "${CANDS[@]}" | grep -qxF -- "$DISK" || die "'$DISK' is not one of: ${CANDS[*]}"
     else
       DISK="${CANDS[0]}"
@@ -136,10 +158,11 @@ else
     lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$DISK"
     if [[ -n "$FSTYPE" ]]; then
       info "$DEV ($SIZE) already has a $FSTYPE filesystem — it will be mounted at $DATA_DIR as-is (no formatting)."
-      [[ "$(ask "Continue? [y/N]:")" =~ ^[Yy] ]] || die "Cancelled — nothing was changed."
+      confirm "Continue?" || die "Cancelled — nothing was changed."
     else
       warn "$DISK ($SIZE) is empty and will be FORMATTED as ext4 and mounted at $DATA_DIR."
-      [[ "$(ask "Type 'yes' to format $DISK:")" == "yes" ]] || die "Cancelled — nothing was changed."
+      ask "Type the word yes to format $DISK (anything else cancels):"
+      [[ "${ANSWER,,}" == "yes" ]] || die "Cancelled — nothing was changed."
       mkfs.ext4 -q -L mydrive -m 1 "$DEV"
       FSTYPE=ext4
       info "formatted $DEV"
@@ -194,7 +217,7 @@ if [[ -z "${DOMAIN:-}" ]]; then
     DOMAIN="$(grep '^MYDRIVE_BASE_URL=' "$ETC_DIR/env" | sed 's#.*://##')"
   else
     IP="$(curl -fsS -m 10 https://api.ipify.org || curl -fsS -m 10 https://ifconfig.me || true)"
-    [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || IP="$(ask "Could not detect the public IP. Enter it:")"
+    [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { ask "Could not detect the public IP. Enter it:"; IP="$ANSWER"; }
     DOMAIN="${IP//./-}.sslip.io"
   fi
 fi
@@ -316,7 +339,8 @@ info "MyDrive and Caddy are running"
 if [[ -z "$(sudo -u mydrive sqlite3 "$DATA_DIR/mydrive.db" 'SELECT 1 FROM users WHERE is_admin=1 LIMIT 1' 2>/dev/null)" ]]; then
   step "Create your admin account"
   while true; do
-    U="$(ask "Admin username (lowercase, e.g. prashant):")"
+    ask "Admin username (lowercase, e.g. prashant):"
+    U="$ANSWER"
     /usr/local/bin/mydrive-admin create-user "$U" --admin </dev/tty && break
   done
 fi
